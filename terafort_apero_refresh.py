@@ -20,6 +20,7 @@
 ================================================================================
 """
 import json
+import time
 import os
 import sys
 
@@ -62,10 +63,34 @@ def main() -> None:
     # We send both spellings defensively -- servers ignore unknown fields.
     body = {"refreshToken": refresh_token, "refresh_token": refresh_token}
 
-    try:
-        resp = requests.post(AUTH_URL, json=body, headers=headers, timeout=TIMEOUT)
-    except requests.RequestException as exc:
-        fail(f"network error: {exc}")
+    # Retry transient failures (5xx / network) with exponential backoff.
+    # NEVER retry 4xx: with rotating tokens, blind retries on auth errors
+    # could damage the chain. 503s from istio-envoy are common cold-start
+    # hiccups on Apero's side and resolve within seconds.
+    attempts, delay = 4, 5
+    resp = None
+    for i in range(1, attempts + 1):
+        try:
+            resp = requests.post(AUTH_URL, json=body, headers=headers,
+                                 timeout=TIMEOUT)
+        except requests.RequestException as exc:
+            if i == attempts:
+                fail(f"network error after {attempts} attempts: {exc}")
+            print(f"⚠️  attempt {i}/{attempts} network error ({exc}); "
+                  f"retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 2
+            continue
+        if resp.status_code >= 500:
+            if i == attempts:
+                fail(f"HTTP {resp.status_code} after {attempts} attempts: "
+                     f"{resp.text[:300]}")
+            print(f"⚠️  attempt {i}/{attempts} got HTTP {resp.status_code} "
+                  f"(Apero server-side); retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 2
+            continue
+        break
 
     if resp.status_code not in (200, 201):
         fail(f"HTTP {resp.status_code}: {resp.text[:300]}")
