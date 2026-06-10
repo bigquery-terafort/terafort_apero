@@ -44,6 +44,7 @@
 import json
 import os
 import sys
+import time
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -110,10 +111,31 @@ HEADERS = {
 
 def post_json(url: str, body: dict | str, step: str) -> dict:
     payload = body if isinstance(body, str) else json.dumps(body)
-    try:
-        resp = requests.post(url, data=payload, headers=HEADERS, timeout=HTTP_TIMEOUT)
-    except requests.RequestException as exc:
-        fail(f"[{step}] network error: {exc}")
+    # Retry transient failures (5xx / network) with backoff; never retry 4xx.
+    attempts, delay = 4, 5
+    resp = None
+    for i in range(1, attempts + 1):
+        try:
+            resp = requests.post(url, data=payload, headers=HEADERS,
+                                 timeout=HTTP_TIMEOUT)
+        except requests.RequestException as exc:
+            if i == attempts:
+                fail(f"[{step}] network error after {attempts} attempts: {exc}")
+            print(f"⚠️  [{step}] attempt {i}/{attempts} network error; "
+                  f"retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 2
+            continue
+        if resp.status_code >= 500:
+            if i == attempts:
+                fail(f"[{step}] HTTP {resp.status_code} after {attempts} "
+                     f"attempts: {resp.text[:300]}")
+            print(f"⚠️  [{step}] attempt {i}/{attempts} got HTTP "
+                  f"{resp.status_code}; retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 2
+            continue
+        break
     if resp.status_code == 401:
         fail(f"[{step}] 401 Unauthorized -- bearer token expired (1h lifetime). "
              f"Grab a fresh one from DevTools and re-run.")
