@@ -1,1 +1,98 @@
+# =============================================================================
+# Terafort <- Apero Partner Report -> BigQuery
+# Path MUST be: .github/workflows/terafort_apero.yml   (plural "workflows"!)
+#
+# Phase 1 (now)  : manual trigger -- paste a fresh bearer token (1h lifetime)
+# Phase 2 (later): uncomment the cron block once refresh-token rotation exists
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   GCP_SA_KEY   full JSON key of a service account with roles:
+#                  - BigQuery Data Editor
+#                  - BigQuery Job User
+#   BQ_PROJECT   your GCP project id (kept as a secret to stay out of logs)
+# =============================================================================
+name: terafort_apero_to_bigquery
 
+on:
+  workflow_dispatch:
+    inputs:
+      apero_bearer_token:
+        description: "Fresh Apero JWT (DevTools -> business-report -> authorization header, WITHOUT the 'Bearer ' prefix; expires in 1h)"
+        required: true
+        type: string
+      lookback_days:
+        description: "Days to pull (rolling window)"
+        required: false
+        default: "30"
+        type: string
+  # ---------------------------------------------------------------------------
+  # PHASE 2 -- enable after refresh-token rotation is built:
+  # schedule:
+  #   - cron: "30 2 * * *"   # 02:30 UTC = 07:30 PKT daily
+  # ---------------------------------------------------------------------------
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apero-pull          # never two pulls at once -> MERGE stays race-free
+  cancel-in-progress: false
+
+jobs:
+  pull-and-load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # mask the token IMMEDIATELY so it can never appear in any log line
+      - name: Mask bearer token in logs
+        run: echo "::add-mask::${{ inputs.apero_bearer_token }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Run Apero -> BigQuery pipeline
+        env:
+          APERO_BEARER_TOKEN: ${{ inputs.apero_bearer_token }}
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          BQ_DATASET: apero
+          BQ_TABLE: apero_daily
+          SKIP_GCS: "1"                       # direct-to-BQ (boss's call);
+                                              # flip to "0" + add GCS_BUCKET
+                                              # to re-enable the raw layer
+          LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+        run: python terafort_apero.py
+
+      - name: Verify load (row counts per day)
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+        run: |
+          python - <<'EOF'
+          import os
+          from google.cloud import bigquery
+          bq = bigquery.Client(project=os.environ["BQ_PROJECT"])
+          q = f"""
+            SELECT report_date, COUNT(*) apps,
+                   ROUND(SUM(revenue_usd),2) revenue,
+                   ROUND(SUM(net_profit_usd),2) net_profit,
+                   MAX(pulled_at_utc) last_pull
+            FROM `{os.environ["BQ_PROJECT"]}.apero.apero_daily`
+            GROUP BY report_date ORDER BY report_date DESC LIMIT 35"""
+          for r in bq.query(q).result():
+              print(f"{r.report_date}  apps={r.apps:<3} revenue={r.revenue:>12,.2f} "
+                    f"net_profit={r.net_profit:>12,.2f}")
+          EOF
