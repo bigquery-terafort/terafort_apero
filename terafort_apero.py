@@ -95,6 +95,7 @@ GCS_BUCKET = env("GCS_BUCKET", required=not (DRY_RUN or SKIP_GCS))
 BQ_PROJECT = env("BQ_PROJECT", required=not DRY_RUN)
 BQ_DATASET = env("BQ_DATASET", "apero")
 BQ_TABLE = env("BQ_TABLE", "apero_daily")
+BQ_LOCATION = env("BQ_LOCATION", "US")     # MUST match your existing datasets' location
 PRODUCTS_BODY = env("PRODUCTS_BODY_JSON", '{"filterType":"partner-report"}')
 
 HEADERS = {
@@ -253,6 +254,7 @@ def to_ndjson(detail: list, products: list, from_iso: str, to_iso: str,
     for r in detail:
         lines.append(json.dumps({
             "report_date": str(r["first_open_time"])[:10],
+            "date_convention": "GMT+7",
             "product_id": r["product_id"],
             "product_uuid": uuid_by_pid.get(r["product_id"]),
             "app_name": r["app_name"],
@@ -302,12 +304,22 @@ def land_and_load(raw: dict, ndjson: str, run_date: str) -> None:
 
     # --- BigQuery: truncate-load staging, then MERGE
     bq = bigquery.Client(project=BQ_PROJECT)
+
+    # foolproof: create the dataset if it doesn't exist (idempotent).
+    # Location MUST match your other datasets (e.g. unified_daily_performance)
+    # or cross-dataset joins will fail -- set BQ_LOCATION accordingly.
+    ds = bigquery.Dataset(f"{BQ_PROJECT}.{BQ_DATASET}")
+    ds.location = BQ_LOCATION
+    bq.create_dataset(ds, exists_ok=True)
+    print(f"✅ dataset ready: {BQ_PROJECT}.{BQ_DATASET} (location={BQ_LOCATION})")
+
     stg = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}_stg"
     tgt = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
     schema = [
         bigquery.SchemaField("report_date", "DATE", mode="REQUIRED"),
         bigquery.SchemaField("product_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("date_convention", "STRING"),
         bigquery.SchemaField("product_uuid", "STRING"),
         bigquery.SchemaField("app_name", "STRING"),
         bigquery.SchemaField("package_name", "STRING"),
@@ -342,6 +354,7 @@ def land_and_load(raw: dict, ndjson: str, run_date: str) -> None:
       CREATE TABLE IF NOT EXISTS `{tgt}` (
         report_date DATE NOT NULL,
         product_id STRING NOT NULL,
+        date_convention STRING,
         product_uuid STRING, app_name STRING, package_name STRING,
         revenue_usd FLOAT64, cost_usd FLOAT64, tax_fee_usd FLOAT64,
         mkt_charge_fee_usd FLOAT64, service_package_usd FLOAT64,
@@ -357,6 +370,7 @@ def land_and_load(raw: dict, ndjson: str, run_date: str) -> None:
       USING `{stg}` S
       ON T.report_date = S.report_date AND T.product_id = S.product_id
       WHEN MATCHED THEN UPDATE SET
+        date_convention=S.date_convention,
         product_uuid=S.product_uuid, app_name=S.app_name,
         package_name=S.package_name, revenue_usd=S.revenue_usd,
         cost_usd=S.cost_usd, tax_fee_usd=S.tax_fee_usd,
