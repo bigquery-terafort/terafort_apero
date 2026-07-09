@@ -12,6 +12,15 @@
  Both values are masked via ::add-mask:: BEFORE being written, so they can
  never appear in any log line.
 
+ FIX (2026-07-09): captured the real browser request via DevTools. The
+ browser sends the refresh token TWO ways on this call:
+   1. As a `Cookie: refresh_token=<jwt>` header
+   2. As `{"refreshToken": "<jwt>"}` in the JSON body
+ The previous version of this script only sent #2, which is what caused
+ the flat 401s (confirmed: it failed even with a freshly-seeded, valid
+ token -- not an expiry issue). Both are now sent to match the browser
+ exactly.
+
  Explicit-fail rules:
    * non-200/201 response  -> exit 1 with instructions to re-seed the secret
    * missing token fields  -> exit 1 (API shape changed)
@@ -57,10 +66,18 @@ def main() -> None:
         "Referer": "https://mktpro.aperogroup.ai/partner-report/business",
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/148.0.0.0 Safari/537.36"),
+                       "Chrome/149.0.0.0 Safari/537.36"),
+        # ---- THE FIX ----
+        # Confirmed via live DevTools capture (2026-07-09): the browser
+        # attaches the refresh token as a Cookie header on this exact call,
+        # in addition to the JSON body. The API appears to require it --
+        # without this header, requests 401 even with a fully valid token.
+        "Cookie": f"refresh_token={refresh_token}",
     }
-    # Confirmed from DevTools capture: payload key is camelCase "refreshToken".
-    # We send both spellings defensively -- servers ignore unknown fields.
+    # Confirmed from DevTools capture (Payload tab): the browser sends
+    # ONLY "refreshToken" (camelCase) in the body -- no snake_case variant.
+    # We still send both defensively; servers ignore unknown fields, and
+    # this protects us if the API ever accepts either spelling.
     body = {"refreshToken": refresh_token, "refresh_token": refresh_token}
 
     # Retry transient failures (5xx / network) with exponential backoff.
@@ -92,6 +109,8 @@ def main() -> None:
             continue
         break
 
+    # 201 Created is what the real API returns on success (confirmed via
+    # DevTools: Status Code 201 Created) -- 200 kept too, just in case.
     if resp.status_code not in (200, 201):
         fail(f"HTTP {resp.status_code}: {resp.text[:300]}")
 
@@ -100,18 +119,21 @@ def main() -> None:
     except ValueError:
         fail(f"non-JSON response: {resp.text[:300]}")
 
-    # Apero wraps most responses in dataSource -- handle wrapped AND flat.
+    # Confirmed via DevTools Response tab: shape is
+    #   {"dataSource": {"name": ..., "accessToken": ..., "refreshToken": ...}}
+    # i.e. camelCase, wrapped in dataSource (not a list here). Handle wrapped
+    # AND flat, and both camelCase/snake_case, to survive minor API drift.
     payload = data.get("dataSource", data)
     if isinstance(payload, list):           # defensive: some endpoints use lists
         payload = payload[0] if payload else {}
 
-    access = payload.get("access_token") or payload.get("accessToken")
-    new_refresh = payload.get("refresh_token") or payload.get("refreshToken")
+    access = payload.get("accessToken") or payload.get("access_token")
+    new_refresh = payload.get("refreshToken") or payload.get("refresh_token")
 
     if not access:
-        fail(f"no access_token in response; keys seen: {list(payload)[:10]}")
+        fail(f"no accessToken in response; keys seen: {list(payload)[:10]}")
     if not new_refresh:
-        fail(f"no refresh_token in response (rotation expected); "
+        fail(f"no refreshToken in response (rotation expected); "
              f"keys seen: {list(payload)[:10]}")
 
     mask(access)
