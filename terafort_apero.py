@@ -8,7 +8,7 @@
                   refresh-token rotation via Secret Manager.
    2. PRODUCTS  : POST /product-metric/products  -> dynamic UUID list
                   (future-proof: new APLs are auto-included, never hardcoded).
-   3. PULL      : POST /partner/business-report  -> last N days, PKT-pinned.
+   3. PULL      : POST /partner/business-report  -> last N days, GMT+7-pinned.
    4. VALIDATE  : schema check, date-window check, rollup-row checksum
                   reconciliation (explicit-fail on any mismatch).
    5. LAND      : raw JSON + NDJSON -> gs://<bucket>/raw/dt=YYYY-MM-DD/
@@ -17,8 +17,15 @@
                   never duplicates.
 
  Bleed-proof principles enforced:
-   * Timezone pinned to +05:00 (PKT) explicitly -- running from a UTC Cloud
-     Function/VM does NOT shift the window.
+   * Timezone pinned to +07:00 (GMT+7 / Indochina) explicitly -- this is the
+     timezone Apero buckets its `first_open_time` calendar days in (confirmed:
+     the UI export column is literally "Date(GMT+7)" and every row carries
+     date_convention="GMT+7"). Pinning the WINDOW to the same +07:00 as the
+     DATA removes the 1-day boundary wobble you get when the window is pinned
+     to a different zone (e.g. PKT +05:00): a nominal 30-day window then maps
+     cleanly to exactly 30 GMT+7 date-rows. GMT+7 has no DST, so +07:00 is
+     stable year-round. Running from a UTC Cloud Function/VM does NOT shift
+     the window -- the offset is hard-pinned, not derived from the host clock.
    * The 1970-01-01 ROLLUP grand-total row is used as a checksum, then
      dropped. It must never reach BigQuery.
    * No silent defaults: every unexpected condition raises and exits non-zero.
@@ -55,7 +62,11 @@ BASE_URL = "https://mktpro.aperogroup.ai"
 PRODUCTS_ENDPOINT = f"{BASE_URL}/api/v1/report/product-metric/products?filterType=partner-report"
 REPORT_ENDPOINT = f"{BASE_URL}/api/v1/report/marketing-report/partner/business-report"
 
-PKT = ZoneInfo("Asia/Karachi")          # +05:00 -- matches the browser payload
+# Apero buckets its data by GMT+7 (Indochina Time, UTC+7, no DST) calendar
+# days. Pinning the pull window to the SAME zone as the data keeps the
+# lookback window aligned to real GMT+7 day boundaries -- no off-by-one.
+APERO_TZ = ZoneInfo("Asia/Bangkok")     # +07:00, no DST -- matches Apero data
+APERO_UTC_OFFSET = "+07:00"             # literal offset used in the API payload
 HTTP_TIMEOUT = 60                        # seconds
 CHECKSUM_ABS_TOL = 0.05                  # USD tolerance for float-sum drift
 
@@ -172,12 +183,18 @@ def fetch_products() -> list[dict]:
 
 
 # --------------------------------------------------------- 3. report pull
-def window_pkt(lookback_days: int) -> tuple[str, str, dt.date, dt.date]:
-    """Replicates the browser payload format exactly: YYYY-MM-DDT23:59:59+05:00"""
-    today_pkt = dt.datetime.now(PKT).date()
-    to_d = today_pkt - dt.timedelta(days=1)            # yesterday = last complete day
+def window_apero(lookback_days: int) -> tuple[str, str, dt.date, dt.date]:
+    """Build the pull window in Apero's own timezone (GMT+7 / +07:00).
+
+    Replicates the browser payload format but pins the offset to +07:00 --
+    the same zone Apero buckets its data in -- so a nominal N-day window
+    maps to exactly N GMT+7 date-rows with no off-by-one boundary wobble.
+    Format: YYYY-MM-DDT23:59:59+07:00
+    """
+    today_gmt7 = dt.datetime.now(APERO_TZ).date()
+    to_d = today_gmt7 - dt.timedelta(days=1)           # yesterday = last complete GMT+7 day
     from_d = to_d - dt.timedelta(days=lookback_days - 1)
-    fmt = lambda d: f"{d.isoformat()}T23:59:59+05:00"
+    fmt = lambda d: f"{d.isoformat()}T23:59:59{APERO_UTC_OFFSET}"
     return fmt(from_d), fmt(to_d), from_d, to_d
 
 
@@ -221,7 +238,9 @@ def validate_and_split(data: dict, from_d: dt.date, to_d: dt.date) -> tuple[list
              f"API behavior changed, refusing to load")
     rollup = rollups[0]
 
-    # date-window sanity: every detail date must sit inside the requested window
+    # date-window sanity: every detail date must sit inside the requested window.
+    # Now that the window is GMT+7-pinned (same zone as the data), detail dates
+    # should sit cleanly inside [from_d, to_d] with no boundary bleed.
     for r in detail:
         d = dt.date.fromisoformat(str(r["first_open_time"])[:10])
         if not (from_d <= d <= to_d):
@@ -390,10 +409,12 @@ def land_and_load(raw: dict, ndjson: str, run_date: str) -> None:
 # --------------------------------------------------------- main
 def main() -> None:
     pulled_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    run_date = dt.datetime.now(PKT).date().isoformat()
+    # run_date now derived in GMT+7 too, so the GCS partition folder
+    # (raw/dt=YYYY-MM-DD) lines up with the data's own day convention.
+    run_date = dt.datetime.now(APERO_TZ).date().isoformat()
 
     products = fetch_products()
-    from_iso, to_iso, from_d, to_d = window_pkt(LOOKBACK_DAYS)
+    from_iso, to_iso, from_d, to_d = window_apero(LOOKBACK_DAYS)
     raw = fetch_report([p["uuid"] for p in products], from_iso, to_iso)
     detail, _rollup = validate_and_split(raw, from_d, to_d)
     ndjson = to_ndjson(detail, products, from_iso, to_iso, pulled_at)
