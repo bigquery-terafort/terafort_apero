@@ -1,30 +1,26 @@
 # =============================================================================
-# Terafort <- Apero Partner Report -> BigQuery        (PHASE 2: full automation)
-# Path MUST be: .github/workflows/terafort_apero.yml   (plural "workflows"!)
+# Terafort <- Apero Partner Report -> BigQuery     (PHASE 2.1: HARDENED)
+# Path MUST be: .github/workflows/terafort_apero.yml
 #
-# Modes:
-#   * SCHEDULED (daily 07:30 PKT) -- refresh-token rotation, zero hands
-#   * MANUAL with token input     -- paste a fresh JWT, skips rotation
-#   * MANUAL without token input  -- uses rotation, same as scheduled
+# v2.1 CHANGES (2026-07-11) — chain-death proofing after the GH_PAT incident:
+#   🛡️ 1. PRE-FLIGHT CANARY: GH_PAT is TESTED (dummy secret write) BEFORE the
+#         refresh token is consumed. Dead PAT => run fails EARLY, chain stays
+#         ALIVE and unconsumed => fix = regenerate PAT only, NO re-seed needed.
+#         (Old order consumed the token first; a dead PAT then lost it.)
+#   🛡️ 2. SECOND DAILY CRON (19:30 PKT): max gap between runs drops from 24h
+#         to ~12h vs the token's 24h lifetime — schedule-delay-proof.
+#   (concurrency guard + persist-before-pull already existed and stay.)
 #
-# Required repo secrets (Settings -> Secrets and variables -> Actions):
-#   GCP_SA_KEY            service account JSON (BigQuery Data Editor + Job User)
-#   BQ_PROJECT            GCP project id
-#   APERO_REFRESH_TOKEN   refresh_token cookie value (seed once; auto-rotates)
-#   GH_PAT                fine-grained PAT, THIS repo only, permission:
-#                         "Secrets" = Read and write  (used to persist the
-#                         rotated refresh token after every run)
-#
-# ROTATION CHAIN RULE: every successful refresh invalidates the previous
-# refresh token. The workflow therefore persists the new token IMMEDIATELY
-# after refresh, BEFORE pulling data. If runs stop for >24h the chain dies --
-# re-seed APERO_REFRESH_TOKEN from DevTools (Application -> Cookies).
+# Required repo secrets: GCP_SA_KEY, BQ_PROJECT, APERO_REFRESH_TOKEN, GH_PAT
+#   GH_PAT: fine-grained, THIS repo only, "Secrets" = Read and write,
+#           expiry 1 YEAR + calendar reminder at 11 months.
 # =============================================================================
 name: terafort_apero_to_bigquery
 
 on:
   schedule:
     - cron: "30 2 * * *"        # 02:30 UTC = 07:30 PKT daily
+    - cron: "30 14 * * *"       # 14:30 UTC = 19:30 PKT daily  (v2.1 safety run)
   workflow_dispatch:
     inputs:
       apero_bearer_token:
@@ -59,6 +55,17 @@ jobs:
         run: |
           echo "::add-mask::${{ inputs.apero_bearer_token }}"
           echo "APERO_BEARER_TOKEN=${{ inputs.apero_bearer_token }}" >> "$GITHUB_ENV"
+
+      # ----- 🛡️ v2.1 PRE-FLIGHT: verify GH_PAT BEFORE consuming the chain ----
+      - name: Pre-flight - GH_PAT can write secrets?
+        if: ${{ inputs.apero_bearer_token == '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh secret set APERO_PAT_CANARY --repo "${{ github.repository }}" --body "ok-$(date +%s)" \
+            || { echo "🚨 GH_PAT dead/expired — refresh token is STILL SAFE (unconsumed)."; \
+                 echo "   Fix: regenerate the fine-grained PAT (Secrets: Read-write, this repo)"; \
+                 echo "   and update the GH_PAT secret. NO token re-seed needed."; exit 1; }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -101,8 +108,7 @@ jobs:
           BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
           BQ_DATASET: apero
           BQ_TABLE: apero_daily
-          SKIP_GCS: "1"                 # direct-to-BQ; flip to "0" + GCS_BUCKET
-                                        # to re-enable the raw landing zone
+          SKIP_GCS: "1"
           LOOKBACK_DAYS: ${{ inputs.lookback_days || '30' }}
         run: python terafort_apero.py   # APERO_BEARER_TOKEN already in env
 
