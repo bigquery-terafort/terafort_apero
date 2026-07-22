@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
- APERO TOKEN REFRESH (Phase 2)  --  POST /api/v1/auth
+ APERO TOKEN REFRESH (Phase 2.2)  --  POST /api/v1/auth
 ================================================================================
  Exchanges the stored refresh_token for a fresh access_token + NEW
  refresh_token (Apero rotates the refresh token on every call).
@@ -20,6 +20,28 @@
  the flat 401s (confirmed: it failed even with a freshly-seeded, valid
  token -- not an expiry issue). Both are now sent to match the browser
  exactly.
+
+ v2.2 FIX (2026-07-22) -- ROTATED-TOKEN SOURCE (chain-death root cause):
+   This is a COOKIE-SESSION API (the 2026-07-09 fix proved auth rides on
+   the cookie). Such servers return the ROTATED refresh token in the
+   Set-Cookie RESPONSE header (that is what a real browser would persist
+   and replay). The JSON body's refreshToken can be a different/stale
+   value. v2.1 persisted the BODY token -- if body != cookie, we saved a
+   dead token and the next run 401'd, which matches the observed pattern
+   (chain dying in <24h even after successful runs, e.g. Jul-14 morning
+   pass -> evening 401 only 10.7h later).
+   v2.2 rule: COOKIE token > body token. Plus a secret-safe diagnostic
+   line (booleans only, never values) so the next run PROVES which source
+   rotates:
+     cookie_token_present=True,  differ=True  -> body was the wrong source
+                                                 (this fix solves it)
+     cookie_token_present=True,  differ=False -> both same; parsing was
+                                                 fine -> suspect external
+                                                 session revocation
+                                                 (human browser logins)
+     cookie_token_present=False              -> cookie never rotates; body
+                                                 was correct all along ->
+                                                 suspect human logins
 
  Explicit-fail rules:
    * non-200/201 response  -> exit 1 with instructions to re-seed the secret
@@ -67,11 +89,11 @@ def main() -> None:
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/149.0.0.0 Safari/537.36"),
-        # ---- THE FIX ----
-        # Confirmed via live DevTools capture (2026-07-09): the browser
-        # attaches the refresh token as a Cookie header on this exact call,
-        # in addition to the JSON body. The API appears to require it --
-        # without this header, requests 401 even with a fully valid token.
+        # ---- THE 2026-07-09 FIX ----
+        # Confirmed via live DevTools capture: the browser attaches the
+        # refresh token as a Cookie header on this exact call, in addition
+        # to the JSON body. The API appears to require it -- without this
+        # header, requests 401 even with a fully valid token.
         "Cookie": f"refresh_token={refresh_token}",
     }
     # Confirmed from DevTools capture (Payload tab): the browser sends
@@ -128,7 +150,29 @@ def main() -> None:
         payload = payload[0] if payload else {}
 
     access = payload.get("accessToken") or payload.get("access_token")
-    new_refresh = payload.get("refreshToken") or payload.get("refresh_token")
+    body_refresh = payload.get("refreshToken") or payload.get("refresh_token")
+
+    # ---- v2.2 FIX + DIAGNOSTIC (2026-07-22): cookie > body ----
+    # Cookie-session API: the token a real browser would persist & replay is
+    # the one in Set-Cookie. If cookie and body ever differ, the COOKIE one
+    # is the live chain; persisting the body one kills the chain.
+    cookie_refresh = resp.cookies.get("refresh_token")
+    if not cookie_refresh:
+        # Edge cases (redirects / multiple Set-Cookie merging): scan raw
+        # headers too before concluding the cookie is absent.
+        for h_name, h_val in resp.headers.items():
+            if h_name.lower() == "set-cookie" and "refresh_token=" in h_val:
+                cookie_refresh = (h_val.split("refresh_token=", 1)[1]
+                                  .split(";", 1)[0].strip())
+                break
+
+    # DIAGNOSTIC -- secret-safe: booleans only, token values NEVER printed.
+    print(f"🔎 rotation-diagnostic: "
+          f"cookie_token_present={bool(cookie_refresh)}, "
+          f"body_token_present={bool(body_refresh)}, "
+          f"differ={bool(cookie_refresh) and bool(body_refresh) and cookie_refresh != body_refresh}")
+
+    new_refresh = cookie_refresh or body_refresh
 
     if not access:
         fail(f"no accessToken in response; keys seen: {list(payload)[:10]}")
@@ -151,7 +195,8 @@ def main() -> None:
 
     who = payload.get("name") or payload.get("email") or "unknown"
     print(f"✅ token refreshed (account: {who}); access token exported, "
-          f"new refresh token staged for secret rotation")
+          f"new refresh token staged for secret rotation "
+          f"(source: {'cookie' if cookie_refresh else 'body'})")
 
 
 if __name__ == "__main__":
