@@ -106,6 +106,7 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Run Apero -> BigQuery pipeline
+        if: steps.before.outputs.skip != 'true'
         env:
           BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
           BQ_DATASET: apero
@@ -176,7 +177,6 @@ jobs:
       # 🔁 RETRY — neeche wala main step 3 baar koshish karta hai.
       #    (nick-fields/retry se: platform API 5xx / timeout par khud dobara)
       - name: Verify load (row counts per day)
-        if: steps.before.outputs.skip != 'true'
         env:
           BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
         run: |
